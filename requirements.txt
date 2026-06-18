@@ -1,0 +1,32 @@
+# Core data
+polars
+pyarrow
+pandas
+numpy
+plotly
+nbformat
+ipywidgets
+
+# Image processing
+Pillow
+openslide-python
+openslide-bin
+
+# ML / deep learning
+# NOTE: Install torch + torchvision separately via conda or pytorch.org
+# conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia
+torch
+torchvision
+torchstain
+scikit-learn
+einops
+kornia
+
+# Utilities
+tqdm
+joblib
+
+# NVIDIA DALI (Linux + CUDA 12.x only)
+# Install separately with:
+# pip install --extra-index-url https://developer.download.nvidia.com/compute/redist nvidia-dali-cuda120
+# nvidia-dali-cuda120
