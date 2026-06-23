@@ -21,6 +21,7 @@ torchstain
 scikit-learn
 einops
 kornia
+pytorch-metric-learning
 
 # Utilities
 tqdm

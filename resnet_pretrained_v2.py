@@ -1,21 +1,17 @@
 from pathlib import Path
-DATA_PATH = Path(r"C:\Users\Eric Arnold\Documents\TCGA_data")
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from clf_head import RESNET
+from clf_head import RESNET, INCEPTION, VGG16, AGG_14, RESNET_CUSTOM
 from data_loader import WSI_loader
 
 from sklearn.metrics import f1_score
 from tqdm import tqdm
 
-from data_loader import DALIdataset
+from data_loader import DALIdataset, unpack_dali
 from nvidia.dali.plugin.pytorch import DALIGenericIterator, LastBatchPolicy
-
-import os
-import contextlib
 
 
 def compute_total_loss(logits, labels, pred_probs, probs, init_prob_loss, init_label_loss):
@@ -24,29 +20,30 @@ def compute_total_loss(logits, labels, pred_probs, probs, init_prob_loss, init_l
     label_loss = (label_loss * probs).mean()
     return ((prob_loss / init_prob_loss) + (label_loss / init_label_loss))
 
-def unpack_dali(batch):
-    tiles       = batch[0]["imgs"].float() / 255.0
-    labels = batch[0]["subtypes"].squeeze().long().to(device)
-    probs = batch[0]["tumor_probs"].to(device)
-    tiles = tiles.float() / 255.0
-    return tiles, labels, probs
-
-run_name = "pretrained_2_vprob_l4"
+run_name = "r18-d50-v3"
 workers  = 16
 batch_size = 256
 
-with contextlib.redirect_stderr(open(os.devnull, 'w')):
-    loader = DALIdataset(run_name=run_name, downsample=False, batch_size=batch_size, num_workers=workers)
-    train_loader = DALIGenericIterator(loader.train, output_map=["imgs", "subtypes", "tumor_probs"], size=len(loader.train_indices), last_batch_policy=LastBatchPolicy.DROP)
-    val_loader =   DALIGenericIterator(loader.val,   output_map=["imgs", "subtypes", "tumor_probs"], size=len(loader.val_indices),   last_batch_policy=LastBatchPolicy.DROP)
+
+loader       = DALIdataset(run_name=run_name, downsample=False, batch_size=batch_size, num_workers=workers)
+train_loader = DALIGenericIterator(loader.train, output_map=["imgs", "subtypes", "tumor_probs"])
+val_loader   = DALIGenericIterator(loader.val,   output_map=["imgs", "subtypes", "tumor_probs"])
 
 device = torch.device("cuda:0")
-model = RESNET(run_name, unfreeze_l4=True).to(device)
+model = RESNET(run_name, unfreeze_last=True, dropout=0.5).to(device)
 # optimizer = torch.optim.Adam(model.head.parameters(), lr=1e-5)
+
 optimizer = torch.optim.Adam([
     {"params": model.head.parameters(), "lr": 1e-5},
-    {"params": model.resnet.layer4.parameters(), "lr": 1e-6},
+    # {"params": model.last.parameters(), "lr": 1e-5},
 ])
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode='min',
+    factor=0.5,
+    patience=3
+)
 
 CELoss = nn.CrossEntropyLoss(weight=loader.get_class_weights().to(device),) #reduction="none")
 BCELoss = nn.BCELoss()
@@ -67,25 +64,27 @@ patience_counter = 0
 init_prob_loss = 1.0
 init_label_loss = 1.0
 
-for epoch in tqdm(range(loader.epoch, 100), desc="Epochs"):
+train_steps = len(loader.train_indices) // batch_size
+val_steps = len(loader.val_indices) // batch_size
+for epoch in tqdm(range(loader.epoch, 20), desc="Epochs"):
     model.train()
-    model.resnet.eval()
-    if model.unfreeze_l4:
-        model.resnet.layer4.train()
+    model.pretrained.eval()
+    # if model.unfreeze_last:
+    #     model.last.train()
 
     train_loss = 0
-    for batch in tqdm(train_loader, desc=f"  Train {epoch}", leave=False):
-        tiles, labels, probs = unpack_dali(batch)
+    for batch in tqdm(train_loader, total=train_steps, desc=f"  Train {epoch}", leave=False):
+        tiles, labels, probs = unpack_dali(batch, device)
         optimizer.zero_grad()
 
-        logits, pred_probs = model(tiles)
+        logits = model(tiles)
         # loss = compute_total_loss(logits, labels, pred_probs, probs, init_prob_loss, init_label_loss)
         loss = CELoss(logits, labels)
 
         loss.backward()
         optimizer.step()
         train_loss += loss.item()
-    train_loss /= len(loader.train_indices)
+    train_loss /= train_steps
 
     model.eval()
     val_loss = 0
@@ -95,10 +94,10 @@ for epoch in tqdm(range(loader.epoch, 100), desc="Epochs"):
     all_labels = []
     # all_probs = []
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc=f"  Val   {epoch}", leave=False):
-            tiles, labels, probs = unpack_dali(batch)
+        for batch in tqdm(val_loader, total=val_steps, desc=f"  Val {epoch}", leave=False):
+            tiles, labels, probs = unpack_dali(batch, device)
 
-            logits, pred_probs = model(tiles)
+            logits = model(tiles)
             # val_loss += compute_total_loss(logits, labels, pred_probs, probs, init_prob_loss, init_label_loss).item()
             val_loss += CELoss(logits, labels).item()
 
@@ -112,7 +111,7 @@ for epoch in tqdm(range(loader.epoch, 100), desc="Epochs"):
             all_labels.extend(labels.cpu().tolist())
             # all_probs.extend(probs.squeeze().cpu().tolist())
 
-    val_loss /= len(loader.val_indices)
+    val_loss /= val_steps
     val_acc = correct / total
 
     per_class_f1 = f1_score(all_labels, all_preds, average=None,) #sample_weight=all_probs)
@@ -123,7 +122,8 @@ for epoch in tqdm(range(loader.epoch, 100), desc="Epochs"):
         "train_loss": train_loss,
         "val_loss": val_loss,
         "val_acc": val_acc,
-    }, class_f1)
+        **class_f1
+    })
 
     print(f"Epoch {epoch} val_acc: {val_acc:.4f} val_loss: {val_loss:.4f}")
 
@@ -137,6 +137,7 @@ for epoch in tqdm(range(loader.epoch, 100), desc="Epochs"):
     #         print(f"Early stopping at epoch {epoch}")
     #         break
     model.save()
-    with contextlib.redirect_stderr(open(os.devnull, 'w')):
-        train_loader = DALIGenericIterator(loader.train, output_map=["imgs", "subtypes", "tumor_probs"], size=len(loader.train_indices), last_batch_policy=LastBatchPolicy.DROP)
-        val_loader =   DALIGenericIterator(loader.val,   output_map=["imgs", "subtypes", "tumor_probs"], size=len(loader.val_indices),   last_batch_policy=LastBatchPolicy.DROP)
+    scheduler.step(val_loss)
+
+    train_loader = DALIGenericIterator(loader.train, output_map=["imgs", "subtypes", "tumor_probs"])
+    val_loader =   DALIGenericIterator(loader.val,   output_map=["imgs", "subtypes", "tumor_probs"])

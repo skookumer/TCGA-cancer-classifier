@@ -30,13 +30,18 @@ if platform.system() == "Linux":
     from nvidia.dali.plugin.pytorch import DALIGenericIterator
     import nvidia.dali.types as types
     
-if platform.system() == "Linux":
-    DATA_PATH = Path("/mnt/c/Users/Eric Arnold/Documents/TCGA_data/tcga_brca_slides")
-    JPG_PATH = Path("/home/ruminator/tcga_brca_jpgs")
-else:
-    DATA_PATH = Path(r"C:\Users\Eric Arnold\Documents\TCGA_data\tcga_brca_slides")
-    JPG_PATH = DATA_PATH.parent / "tcga_brca_jpgs"
-    JPG_PATH.mkdir(exist_ok=True)
+# if platform.system() == "Linux":
+#     DATA_PATH = Path("/mnt/c/Users/Eric Arnold/Documents/TCGA_data/tcga_brca_slides")
+#     JPG_PATH = Path("/home/ruminator/tcga_brca_jpgs")
+# else:
+#     DATA_PATH = Path(r"C:\Users\Eric Arnold\Documents\TCGA_data\tcga_brca_slides")
+#     JPG_PATH = DATA_PATH.parent / "tcga_brca_jpgs"
+
+DATA_PATH = Path("/home/eric/TCGA_data/tcga_brca_slides")
+JPG_PATH = DATA_PATH.parent / "tcga_brca_jpgs"
+
+DATA_PATH.mkdir(exist_ok=True)
+JPG_PATH.mkdir(exist_ok=True)
 
 LOG_PATH = Path(__file__).parent / "logs"
 LOG_PATH.mkdir(exist_ok=True)
@@ -50,6 +55,15 @@ LABEL_MAP = {"LumA": 0, "LumB": 1, "Basal": 2, "Her2": 3}
 class WSI_loader:
 
     def __init__(self, run_name="none", cache_max=24, downsample=False, tumor_prob=.9, balance_classes=True):
+        '''
+        Data loading class that has multiple ways of serving up the data. Development went like this:
+
+        read from WSIs (openslide) -> read from jpeg (PIL) -> subset w/ tumor_prob -> Nvidia DALI
+        (CPU decode)                  (CPU decode, transform GPU)                     (all GPU)
+
+        So there are multiple redundant aspects to this class, but I kept it for posterity.
+        But CPU decoding can be used to maximize GPU througput with a high-powered system.
+        '''
 
         self.run_name = run_name
         self.log_path = LOG_PATH / f"{run_name}.jsonl"
@@ -60,7 +74,7 @@ class WSI_loader:
         if self.log_path.exists():
             with open(self.log_path, "r", encoding="utf-8") as f:
                 last_line = json.loads(f.readlines()[-1])
-                self.epoch = last_line["epoch"]
+                self.epoch = last_line["epoch"] + 1
         else:
             self.epoch = 0
 
@@ -69,6 +83,8 @@ class WSI_loader:
         self.classes = {v: k for k, v in LABEL_MAP.items()}
 
         self.patient_lookup = {p.name: p for p in list(DATA_PATH.iterdir())}
+
+        #these are cpu normalizations for the initial version of the program
         self.normalize = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], 
@@ -86,55 +102,17 @@ class WSI_loader:
         self.enumerate_tiles()
         self.get_labels()
         self.set_indices()
-        self.slide_cache = {}
+        self.slide_cache = {} #the original approach of reading data directly from the WSIs using openslide (ram-hungry)
         self.cache_max = cache_max
 
-    def set_indices(self):
-
-        index_df = (
-            self.df
-            .with_row_index()
-            .filter(~pl.col("is_empty"))
-            .select(["index", "patient_name", "tumor_prob"])
-            .join(
-                self.label_lookup.select(["file_id", "subtype"]),
-                left_on="patient_name",   # UUID folder name
-                right_on="file_id",       # matching UUID from metadata
-                how="inner"
-            )
-        )
-
-        if self.balance_classes:
-            subtypes = [index_df.filter(pl.col("subtype") == s) for s in LABEL_MAP]
-            min_count = min([df.shape[0] for df in subtypes])
-            subtypes = [df.sort("tumor_prob", descending=True)[:min_count] for df in subtypes]
-            index_df = pl.concat(subtypes)
-
-        patients = index_df["patient_name"].unique().to_list()
-        
-        if self.downsample:
-            patients = patients[:self.downsample]
-
-        labels = [index_df.filter(pl.col("patient_name") == p)["subtype"][0] for p in patients]
-
-        # split off test
-        train_patients, test_patients, train_labels, _ = train_test_split(patients, labels, stratify=labels, test_size=0.2, random_state=42)
-
-        # split train into train/val
-        train_patients, val_patients = train_test_split(train_patients, stratify=train_labels, test_size=0.2, random_state=42)
-
-        self.train_indices = index_df.filter(pl.col("patient_name").is_in(train_patients))["index"].to_list()
-        self.val_indices   = index_df.filter(pl.col("patient_name").is_in(val_patients))["index"].to_list()
-        self.test_indices  = index_df.filter(pl.col("patient_name").is_in(test_patients))["index"].to_list()
-        self.train_df = index_df.filter(pl.col("patient_name").is_in(train_patients))
-    
-    def get_class_weights(self):
-        labels = torch.tensor([LABEL_MAP[s] for s in self.train_df["subtype"].to_list()], dtype=torch.long)
-        counts = torch.bincount(labels, minlength=4).float()
-        weights = 1.0 / counts
-        return weights / weights.sum()
-
     def enumerate_tiles(self):
+        '''
+        Creates a manifest of all tiles and their coordinates for retrieval directly from WSIs.
+        If new data are downloaded from GDC, this function segments WSIs into tiles and checks
+        to see if they're mostly empty.
+
+        Uses parallelization for speed.
+        '''
         cols = {
             "patient_name": pl.Utf8,
             "crd": pl.List(pl.Int64),
@@ -188,32 +166,12 @@ class WSI_loader:
                 df_new = pl.DataFrame(rows, schema=cols)
                 self.df = pl.concat([self.df, df_new])
                 self.df.write_parquet(DF_PATH)
-    
-    def write_jpgs(self):
-
-        non_empty = self.df.filter(~pl.col("is_empty"))
-        patients = non_empty["patient_name"].unique().to_list()
-        subsets = [non_empty.filter(pl.col("patient_name") == name) for name in patients]
-
-        def get_and_write_downsized_tile(subset):
-            p = subset["patient_name"][0]
-            img = WSISlide(DATA_PATH / p)
-            for row in subset.iter_rows(named=True):
-                crds = row["crd"]
-                idx = row["idx"]
-                tile = img.read(crds[0], crds[1])
-                tile = tile.resize((224, 224), Image.LANCZOS)
-                tile.save(JPG_PATH / f"{idx}.jpg", quality=90)
-            img.close()
-
-        Parallel(n_jobs=4)(
-            delayed(get_and_write_downsized_tile)(s)
-            for s in tqdm(subsets, total=len(subsets))
-        )
-        
-
 
     def get_labels(self):
+        '''
+        Uses the metadata from GDC to get the folder names and align them with the entity_ids
+        (and other ids) from the UCSC Xena clinical matrix.
+        '''
         with open(DATA_PATH.parent / "metadata.repository.2026-06-04.json") as f:
             metadata = json.load(f)
 
@@ -246,7 +204,85 @@ class WSI_loader:
             how="left"
         )
 
+    def set_indices(self):
+        '''
+        Aligns the preprocessed indices of individual tiles with molecular subtypes.
+        Facilitates train/val/test split and sets separate indices as attributes.
+        Splits the dataset on patient to prevent data leakage.     
+        '''
+
+        index_df = (
+            self.df
+            .with_row_index()
+            .filter(~pl.col("is_empty"))
+            .select(["index", "patient_name", "tumor_prob"])
+            .join(
+                self.label_lookup.select(["file_id", "subtype"]),
+                left_on="patient_name",   # UUID folder name
+                right_on="file_id",       # matching UUID from metadata
+                how="inner"
+            )
+        )
+
+        if self.balance_classes:
+            subtypes = [index_df.filter(pl.col("subtype") == s) for s in LABEL_MAP]
+            min_count = min([df.shape[0] for df in subtypes])
+            subtypes = [df.sort("tumor_prob", descending=True)[:min_count] for df in subtypes]
+            index_df = pl.concat(subtypes)
+
+        patients = index_df["patient_name"].unique().to_list()
+        
+        if self.downsample:
+            patients = patients[:self.downsample]
+
+        labels = [index_df.filter(pl.col("patient_name") == p)["subtype"][0] for p in patients]
+
+        # split off test
+        train_patients, test_patients, train_labels, _ = train_test_split(patients, labels, stratify=labels, test_size=0.2, random_state=42)
+
+        # split train into train/val
+        train_patients, val_patients = train_test_split(train_patients, stratify=train_labels, test_size=0.2, random_state=42)
+
+        self.train_indices = index_df.filter(pl.col("patient_name").is_in(train_patients))["index"].to_list()
+        self.val_indices   = index_df.filter(pl.col("patient_name").is_in(val_patients))["index"].to_list()
+        self.test_indices  = index_df.filter(pl.col("patient_name").is_in(test_patients))["index"].to_list()
+        self.train_df = index_df.filter(pl.col("patient_name").is_in(train_patients))
+    
+    def write_jpgs(self):
+        '''
+        Instead of opening WSIs (openslide) from disk or from cache, decided to write non-empty tiles as
+        resized jpegs to a folder for quicker and more efficient retrieval with PIL.
+        '''
+
+        non_empty = self.df.filter(~pl.col("is_empty"))
+        patients = non_empty["patient_name"].unique().to_list()
+        subsets = [non_empty.filter(pl.col("patient_name") == name) for name in patients]
+
+        def get_and_write_downsized_tile(subset):
+            p = subset["patient_name"][0]
+            img = WSISlide(DATA_PATH / p)
+            for row in subset.iter_rows(named=True):
+                crds = row["crd"]
+                idx = row["idx"]
+                tile = img.read(crds[0], crds[1])
+                tile = tile.resize((224, 224), Image.LANCZOS)
+                tile.save(JPG_PATH / f"{idx}.jpg", quality=90)
+            img.close()
+
+        Parallel(n_jobs=4)(
+            delayed(get_and_write_downsized_tile)(s)
+            for s in tqdm(subsets, total=len(subsets))
+        )
+
+    def get_class_weights(self):
+        '''function for serving class weights to the cross entropy loss object'''
+        labels = torch.tensor([LABEL_MAP[s] for s in self.train_df["subtype"].to_list()], dtype=torch.long)
+        counts = torch.bincount(labels, minlength=4).float()
+        weights = 1.0 / counts
+        return weights / weights.sum()
+
     def get_normed_tensor(self, idx, resize_to=224, transform=True):
+        '''old function for getting tiles directly from WSIs'''
         tile = self.get_tile(idx)
         if resize_to is not None:
             tile = tile.resize((resize_to, resize_to), Image.LANCZOS)
@@ -255,15 +291,17 @@ class WSI_loader:
         return self.normalize(tile)
     
     def get_tensor(self, idx):
+        '''newer function that just gets a tensor for cpu decoding and gpu transforms'''
         return self.to_tensor(self.get_tile(idx))
     
     def get_slide(self, file_id):
+        '''old function that puts slides in the slide cache for faster opening per worker'''
         if file_id not in self.slide_cache:
             self.slide_cache[file_id] = WSISlide(self.patient_lookup[file_id])
         return self.slide_cache[file_id]
 
     def get_tile(self, idx):
-
+        '''re-used function that can load from jpegs or from WSI for CPU transforming/ decoding'''
         jpg_path = JPG_PATH / f"{idx}.jpg"
         if jpg_path.exists():
             return Image.open(jpg_path)
@@ -275,6 +313,7 @@ class WSI_loader:
         return slide.read(crds[0], crds[1])
     
     def get_chunk(self, patient_id, x=-1, y=-1, w=1920, h=1080):
+        '''test function that can just get a chunk of a WSI for visualization'''
         if type(patient_id) != str:
             patient_id = list(self.patient_lookup.keys())[patient_id]
         path = self.patient_lookup[patient_id]
@@ -291,14 +330,18 @@ class WSI_loader:
         image.show()
 
     def get_label(self, subtype):
+        '''for pytorch dataloader'''
         return torch.tensor(LABEL_MAP[subtype], dtype=torch.long)
 
     def __getitem__(self, i):
+        '''old method to enable compatibility with the pytorch dataloader class'''
         idx = self.valid_indices[i]
         row = self.df[idx]
         label = self.get_label(row["patient_name"][0])
         tile = self.get_normed_tensor(idx)
         return tile, label
+    
+    '''properties necessary to allow pytorch to access different tile sets'''
 
     @property
     def train(self):
@@ -316,21 +359,20 @@ class WSI_loader:
     def all_indices_for_tumor_clf(self):
         return TumorSet(self, self.df.filter(~pl.col("is_empty"))["idx"].to_list())
     
-    def write_log(self, input_dict, class_f1):
+    def write_log(self, log_dict):
+        '''log write function to keep pathing self-contained'''
         with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"epoch": input_dict["epoch"],
-                                "train_loss": input_dict["train_loss"],
-                                "val_loss": input_dict["val_loss"],
-                                "val_acc": input_dict["val_acc"],
-                                "per_class_f1": {k: v for k, v in class_f1.items()}}) + "\n")
+            f.write(json.dumps(log_dict) + "\n")
     
     def map_tiles(self, patient_name):
+        '''function to eventually be used with whole-slide classification'''
         rows = self.df.filter(pl.col("patient_name") == patient_name)
         indices = rows["idx"].to_list()
         coords = [tuple(crd / 512 for crd in crds) for crds in rows["crds"].to_list()]
         jpgs = [Image.open(JPG_PATH / f"{idx}.jpg") for idx in indices]
     
     def get_tile_for_tumor_detection(self, idx):
+        '''function to take a 350x350 chunk out of each 512x512 tile for tumor classification'''
         row = self.df[idx]
         file_id = row["patient_name"][0]
         slide = self.get_slide(file_id)
@@ -346,11 +388,10 @@ class WSI_loader:
         )
         
 
-
-
 class WSISlide:
 
     def __init__(self, patient_path):
+        '''class to facilitate easy input from WSI slides and to bake in dimensioning'''
         img_path = [f for f in patient_path.iterdir() if f.suffix == ".svs"]
         self.slide = openslide.OpenSlide(img_path[0])
         self.x = float(self.slide.properties.get(openslide.PROPERTY_NAME_MPP_X))
@@ -375,7 +416,9 @@ class WSISlide:
 
 
 class TileSubset(Dataset):
+
     def __init__(self, parent, indices):
+        '''child class that allows pytorch to access different index sets'''
         self.parent = parent
         self.indices = indices
 
@@ -393,6 +436,7 @@ class TileSubset(Dataset):
 class TumorSet(Dataset):
 
     def __init__(self, parent, indices):
+        '''specific class for the tumor detection script'''
         self.parent = parent
         self.indices = indices
     
@@ -405,9 +449,10 @@ class TumorSet(Dataset):
         return self.parent.to_tensor(tile), idx
 
 if platform.system() == "Linux":
-
+    '''DALI only works on Linux'''
 
     # @pipeline_def
+    '''old pipeline def that uses non-parallel make_source kept as reference'''
     # def dali_pipeline(source):
     #     imgs, subtypes, tumor_probs = fn.external_source(
     #         source=source,
@@ -423,6 +468,7 @@ if platform.system() == "Linux":
 
     @pipeline_def
     def dali_pipeline(file_paths, labels, tumor_probs):
+        '''separate function to define the pipeline'''
         imgs, subtypes = fn.readers.file(files=file_paths, labels=labels, random_shuffle=True)
         images = fn.decoders.image(imgs, device="mixed", output_type=types.RGB)
         images = fn.transpose(images, perm=[2, 0, 1])
@@ -432,13 +478,16 @@ if platform.system() == "Linux":
     class DALIdataset(WSI_loader):
         
         def __init__(self, run_name="none", downsample=False, batch_size=32, num_workers=8, device_id=0):
+            '''class that returns the properly configured DALI loader'''
             super().__init__(run_name=run_name, downsample=downsample)
             self.batch_size = batch_size
             self.num_workers = num_workers
             self.device_id = device_id 
 
         def make_source(self, indices):
-            
+            '''old method that formats information in a manner that DALI expects
+            Images are stored in binary and passed to the GPU to be decoded, hence frombuffer.
+            '''
             for i in range(0, len(indices), self.batch_size):
                 batch_indices = indices[i:i + self.batch_size]
                 batch = self.df[batch_indices]
@@ -454,6 +503,9 @@ if platform.system() == "Linux":
                 yield imgs, subtypes, tumor_probs
 
         def prep_pipeline(self, indices):
+            '''
+            New pipeline preparation method that works with the new pipeline defeinition (fn.readers)
+            '''
             batch = self.df[indices]
             file_paths  = [str(JPG_PATH / f"{idx}.jpg") for idx in batch["idx"].to_list()]
             labels      = batch["subtype"].replace(LABEL_MAP).to_list()
@@ -470,6 +522,7 @@ if platform.system() == "Linux":
             pipeline.build()
             return pipeline
 
+        '''old pipeline functions to return the child class'''
         # @property
         # def train(self):
         #     source = self.make_source(self.train_indices)
@@ -491,6 +544,7 @@ if platform.system() == "Linux":
         #     pipeline.build()
         #     return pipeline
 
+        '''new pipeline functions'''
         @property
         def train(self):
             return self.prep_pipeline(self.train_indices)
@@ -503,9 +557,19 @@ if platform.system() == "Linux":
         def test(self):
             return self.prep_pipeline(self.test_indices)
 
+def unpack_dali(batch, device):
+    '''functions to unpack DALI batches served by the iterator'''
+    tiles  = batch[0]["imgs"].float() / 255.0
+    labels = batch[0]["subtypes"].squeeze().long().to(device)
+    probs  = batch[0]["tumor_probs"].to(device)
+    return tiles, labels, probs
+
 
 if __name__ == "__main__":
     l = WSI_loader("clf1")
+    print(torch.cuda.is_available())       # True or False
+    print(torch.version.cuda)              # CUDA version PyTorch was built with
+    print(torch.cuda.get_device_name(0))   # GPU name, e.g. "NVIDIA GeForce RTX 3090"
     # print(l.df.head())
     # l.write_jpgs()
     # l.get_chunk(0, w=10000, h=10000)
